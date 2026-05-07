@@ -1,0 +1,25 @@
+name: Hourly Stock Scanner
+
+on:
+  schedule:
+    # 월~금 08:00~15:00 정각 실행 (한국 시간)
+    # UTC 기준 23, 0, 1, 2, 3, 4, 5, 6시가 한국의 08~15시입니다.
+    - cron: '0 23,0,1,2,3,4,5,6 * * 1-5'
+  workflow_dispatch: # 직접 버튼 눌러서 테스트하기 용도
+
+jobs:
+  run-scanner:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+      - name: Dependencies
+        run: pip install FinanceDataReader yfinance pandas requests
+      - name: Execute
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python stock_rec.py
