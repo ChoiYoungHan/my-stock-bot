@@ -17,7 +17,7 @@ jobs:
         with:
           python-version: '3.9'
       - name: Dependencies
-        run: pip install FinanceDataReader yfinance pandas requests
+        run: pip install finance-datareader yfinance pandas requests
       - name: Execute
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
