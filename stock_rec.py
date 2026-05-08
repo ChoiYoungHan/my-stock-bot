@@ -50,12 +50,15 @@ def analyze_logic(ticker, df, name):
     if prev['MA5'] <= prev['MA20'] and curr['MA5'] > curr['MA20']:
         matches.append("골든크로스 (5/20)")
 
-    # 4. 변곡점 (REVERSAL) - 하락 후 양봉 도지 발생
+    # 4. 변곡점 (REVERSAL) - 하락 후 BB하단 근처 도지 발생 필수
     o, h, l, c = prev['Open'], prev['High'], prev['Low'], prev['Close']
     body = abs(c - o)
     is_positive_doji = (c > o) and (body <= (h-l)*0.25) if (h-l)>0 else False
-    if (d2['Close'] > prev['Close']) and is_positive_doji and (curr['Close'] > curr['Open']):
-        matches.append("변곡점 (양봉도지 반등)")
+    # 추가된 조건: 전일 종가가 BB 하단 5% 이내여야 함
+    is_at_bottom = (prev['Close'] <= prev['BB_L'] * 1.05)
+    
+    if (d2['Close'] > prev['Close']) and is_positive_doji and (curr['Close'] > curr['Open']) and is_at_bottom:
+        matches.append("변곡점 (BB하단 도지 반등)")
 
     results = []
     for m in matches:
@@ -87,15 +90,16 @@ def process_market(market_name, tickers, names):
     header, cur_symbol = ("🇰🇷", "₩") if market_name == "KOREA" else ("🇺🇸", "$")
 
     if not category_map:
-        send_telegram(f"{header} **[{market_name}]** 포착 종목 없음")
+        send_telegram(f"{header} **[{market_name}]** 현재 조건 부합 종목 없음")
         return
 
     msg = f"{header} **[{market_name} 시장 분석]**\n{now.strftime('%m/%d %H:%M')}\n---"
     
-    # 사유별로 그룹화하여 출력
-    for cat in ["상승추세 (정배열)", "바닥반등 (BB하단 지지)", "골든크로스 (5/20)", "변곡점 (양봉도지 반등)"]:
+    # 사유별 그룹화 및 아이콘 변경
+    categories = ["상승추세 (정배열)", "바닥반등 (BB하단 지지)", "골든크로스 (5/20)", "변곡점 (BB하단 도지 반등)"]
+    for cat in categories:
         if cat in category_map:
-            msg += f"\n\n🔵 **{cat}**\n"
+            msg += f"\n\n📌 **{cat}**\n"
             stocks = sorted(category_map[cat], key=lambda x: -abs(x['change']))
             for s in stocks[:8]:
                 msg += f"└ {s['name']} ({cur_symbol}{s['price']:,.0f}, {s['change']:+.2f}%)\n"
@@ -103,12 +107,12 @@ def process_market(market_name, tickers, names):
     send_telegram(msg)
 
 def main():
-    # 한국 상위 500개
+    # 국장 상위 500개
     kor = fdr.StockListing('KRX').sort_values('Marcap', ascending=False).head(500)
     kor_t = [r['Code'] + (".KS" if r['Market'] == 'KOSPI' else ".KQ") for _, r in kor.iterrows()]
     process_market("KOREA", kor_t, dict(zip(kor_t, kor['Name'])))
 
-    # 미국 S&P 500
+    # 미장 S&P 500
     us = fdr.StockListing('S&P500')
     us_t = [t.replace('.', '-') for t in us['Symbol']]
     process_market("USA", us_t, dict(zip(us_t, us['Name'])))
