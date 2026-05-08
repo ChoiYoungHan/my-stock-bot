@@ -14,7 +14,7 @@ TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 def send_telegram(msg):
-    """텔레그램 메시지 전송 함수埋"""
+    """텔레그램 메시지 전송 함수"""
     if not (TOKEN and CHAT_ID):
         print("에러: TELEGRAM_TOKEN 또는 TELEGRAM_CHAT_ID 환경변수가 설정되지 않았습니다.")
         return
@@ -37,7 +37,7 @@ def calculate_indicators(df):
     df['MA60'] = c.rolling(60).mean()
     df['V_MA20'] = v.rolling(20).mean()
     
-    # 불린저 밴드 계산 (20일, 2표준편차)
+    # 불린저 밴드
     std = c.rolling(20).std()
     df['BB_U'], df['BB_L'] = df['MA20'] + (std * 2), df['MA20'] - (std * 2)
     
@@ -51,7 +51,7 @@ def calculate_indicators(df):
     return df
 
 def analyze_candle(row):
-    """현재 봉(Candle)의 모양 분석"""
+    """봉(Candle)의 모양 분석 로직"""
     o, h, l, c = row['Open'], row['High'], row['Low'], row['Close']
     total = h - l
     if total == 0: return ""
@@ -60,22 +60,22 @@ def analyze_candle(row):
     upper_tail = h - max(o, c)
     lower_tail = min(o, c) - l
     
+    if body < total * 0.1: return "⚖️도지(변곡)"
     if lower_tail > total * 0.5: return "⚓아래꼬리(지지)"
     if upper_tail > total * 0.5: return "⚠️위꼬리(저항)"
-    if body < total * 0.1: return "⚖️도지(변곡)"
     if c > o and body > total * 0.8: return "🔥장대양봉"
     
     return ""
 
 def analyze_logic(ticker, df, name):
-    """전략 판별 및 캔들 분석 통합"""
+    """전략 판별 로직"""
     if len(df) < 60: return None, None
     df = calculate_indicators(df)
     
-    curr = df.iloc[-1]
-    prev = df.iloc[-2]
-    d2 = df.iloc[-3]
-    d3 = df.iloc[-4]
+    curr = df.iloc[-1]   # 당일
+    prev = df.iloc[-2]   # 전일 (도지 기대)
+    d2 = df.iloc[-3]     # 2일 전 (하락 기대)
+    d3 = df.iloc[-4]     # 3일 전 (하락 기대)
     
     candle_type = analyze_candle(curr)
 
@@ -87,23 +87,23 @@ def analyze_logic(ticker, df, name):
         "candle": candle_type
     }
     
-    # --- [전략 1: 불린저 하단 + 3일 하락 후 장악형 패턴] ---
-    # 1. 최근 3일간 종가 하락 (T-3 > T-2 > T-1)
+    # --- [신규 전략: 2일 하락 + 도지 + 당일 양봉 + BB바닥] ---
+    # 1. 2일 연속 하락 (T-3 > T-2)
     is_falling = (d3['Close'] > d2['Close']) and (d2['Close'] > prev['Close'])
-    # 2. 전일 음봉 & 금일 양봉
-    was_bearish = prev['Open'] > prev['Close']
-    is_bullish = curr['Close'] > curr['Open']
-    # 3. 장악 조건: 금일 종가가 전일 시가 이상
-    is_engulfing = curr['Close'] >= prev['Open']
-    # 4. 바닥권 조건: 전일 종가가 BB 하단 2% 이내 혹은 금일 저가가 BB 하단 이하(터치)
-    is_near_bb_bottom = (prev['Close'] <= prev['BB_L'] * 1.02) or (curr['Low'] <= curr['BB_L'])
+    # 2. 전일(T-1)이 도지형 캔들 (몸통이 전체 변동폭의 15% 미만)
+    prev_total = (prev['High'] - prev['Low'])
+    is_prev_doji = (abs(prev['Open'] - prev['Close']) < prev_total * 0.15) if prev_total > 0 else False
+    # 3. 금일(T)이 양봉
+    is_today_bullish = curr['Close'] > curr['Open']
+    # 4. 바닥권 조건: 전일이나 금일이 BB 하단 근처 (2% 이내)
+    is_near_bb_bottom = (prev['Close'] <= prev['BB_L'] * 1.02) or (curr['Low'] <= curr['BB_L'] * 1.01)
 
-    if is_falling and was_bearish and is_bullish and is_engulfing and is_near_bb_bottom:
-        return "ENGULFING", res
+    if is_falling and is_prev_doji and is_today_bullish and is_near_bb_bottom:
+        return "REVERSAL", res
 
     # --- 기존 공통 필터 (거래량) ---
     is_korea = ".K" in ticker
-    vol_threshold = 1.2 if is_korea else 0.5
+    vol_threshold = 1.1 if is_korea else 0.5
     if curr['Volume'] < curr['V_MA20'] * vol_threshold: 
         return None, None
 
@@ -112,22 +112,20 @@ def analyze_logic(ticker, df, name):
         return "TREND", res
     if prev['Close'] < prev['BB_L'] * 1.02 and curr['Close'] > curr['Open'] and curr['RSI'] < 50:
         return "REBOUND", res
-    if (prev['MA5'] <= prev['MA20'] and curr['MA5'] > curr['MA20']) or \
-       (prev['Tenkan'] <= prev['Kijun'] and curr['Tenkan'] > curr['Kijun']):
+    if (prev['MA5'] <= prev['MA20'] and curr['MA5'] > prev['MA20']):
         return "CROSS", res
             
     return None, None
 
 def process_market(market_name, tickers, names):
-    """시장별 프로세스 실행 및 리포트 작성"""
-    print(f"[{market_name}] 데이터 수집 및 분석 중...")
+    """시장별 프로세스 실행"""
+    print(f"[{market_name}] 데이터 분석 중...")
     try:
         data = yf.download(tickers, period="8mo", group_by='ticker', threads=True, progress=False)
-    except Exception as e:
-        print(f"[{market_name}] 다운로드 실패: {e}")
+    except:
         return
     
-    storage = {"TREND": [], "REBOUND": [], "CROSS": [], "ENGULFING": []}
+    storage = {"TREND": [], "REBOUND": [], "CROSS": [], "REVERSAL": []}
     for ticker in tickers:
         try:
             df = data[ticker].dropna()
@@ -140,7 +138,7 @@ def process_market(market_name, tickers, names):
     header = "🇰🇷" if market_name == "KOREA" else "🇺🇸"
     cur_symbol = "₩" if market_name == "KOREA" else "$"
     
-    # 1. 메인 전략 리포트 전송
+    # 1. 일반 리포트
     output = f"{header} **[{market_name} 시장 리포트]**\n"
     output += f"분석: {now_kst.strftime('%m/%d %H:%M')} (KST)\n\n"
     
@@ -149,50 +147,41 @@ def process_market(market_name, tickers, names):
         output += f"{title}\n"
         items = sorted(storage[key], key=lambda x: abs(x['change']), reverse=True)[:5]
         if not items:
-            output += "└ 충족 종목 없음\n"
+            output += "└ 없음\n"
         else:
             for i in items:
-                candle_tag = f" `{i['candle']}`" if i['candle'] else ""
-                output += f"└ {i['name']} ({cur_symbol}{i['price']:,.0f}, {i['change']:+.2f}%){candle_tag}\n"
+                output += f"└ {i['name']} ({cur_symbol}{i['price']:,.0f}, {i['change']:+.2f}%)\n"
         output += "\n"
-    
     send_telegram(output)
 
-    # 2. 불린저 하단 장악형(ENGULFING) 별도 메시지 전송
-    if storage["ENGULFING"]:
-        eng_msg = f"{header} **[{market_name}] 바닥권 역전환 포착**\n"
-        eng_msg += "*(BB하단 근처 + 3일 하락 후 장악형)*\n\n"
-        for i in storage["ENGULFING"]:
+    # 2. 변곡점(REVERSAL) 리포트 별도 전송
+    if storage["REVERSAL"]:
+        rev_msg = f"{header} **[{market_name}] 변곡점 포착 (하락-도지-양봉)**\n"
+        rev_msg += "*(BB하단 지지 + 추세 전환 신호)*\n\n"
+        for i in storage["REVERSAL"]:
             candle_tag = f" `{i['candle']}`" if i['candle'] else ""
-            eng_msg += f"⭐ **{i['name']}**\n"
-            eng_msg += f"└ 현재가: {cur_symbol}{i['price']:,.0f} ({i['change']:+.2f}%)\n"
-            eng_msg += f"└ 특이사항: {candle_tag if candle_tag else '바닥 지지 및 장악'}\n\n"
-        send_telegram(eng_msg)
+            rev_msg += f"💎 **{i['name']}**\n"
+            rev_msg += f"└ 현재가: {cur_symbol}{i['price']:,.0f} ({i['change']:+.2f}%){candle_tag}\n\n"
+        send_telegram(rev_msg)
 
 def main():
-    start_time = datetime.now()
-    print(f"--- 분석 시작: {start_time.strftime('%H:%M:%S')} ---")
-
-    # 1. 한국 시장 (시총 상위 300위)
+    print("--- 분석 시작 ---")
+    # 한국 시장
     try:
         kor_listing = fdr.StockListing('KRX').sort_values('Marcap', ascending=False).head(300)
         kor_tickers = [row['Code'] + (".KS" if row['Market'] == 'KOSPI' else ".KQ") for _, row in kor_listing.iterrows()]
         kor_names = dict(zip(kor_tickers, kor_listing['Name']))
         process_market("KOREA", kor_tickers, kor_names)
-    except Exception as e:
-        print(f"한국 시장 데이터 로드 실패: {e}")
+    except: pass
 
-    # 2. 미국 시장 (S&P 500)
+    # 미국 시장
     try:
         us_listing = fdr.StockListing('S&P500')
         us_tickers = list(us_listing['Symbol'])
         us_names = dict(zip(us_listing['Symbol'], us_listing['Name']))
         process_market("USA", us_tickers, us_names)
-    except Exception as e:
-        print(f"미국 시장 데이터 로드 실패: {e}")
-
-    end_time = datetime.now()
-    print(f"--- 분석 완료 (소요시간: {end_time - start_time}) ---")
+    except: pass
+    print("--- 분석 완료 ---")
 
 if __name__ == "__main__":
     main()
