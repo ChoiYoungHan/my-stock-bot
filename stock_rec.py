@@ -10,7 +10,7 @@ import logging
 import os
 
 # =========================================================
-# 기본 설정
+# 설정
 # =========================================================
 
 logging.getLogger("yf").setLevel(logging.CRITICAL)
@@ -22,6 +22,9 @@ KOR_TOP_N = 500
 USA_TOP_N = 500
 
 MIN_SCORE = 55
+
+# 이미 급등한 종목 제외
+MAX_DAILY_CHANGE = 10.0
 
 # =========================================================
 # 텔레그램
@@ -37,13 +40,12 @@ def send_telegram(msg):
 
     payload = {
         "chat_id": CHAT_ID,
-        "text": msg,
-        "parse_mode": "Markdown"
+        "text": msg
     }
 
     try:
         requests.post(url, json=payload, timeout=20)
-    except Exception:
+    except:
         pass
 
 # =========================================================
@@ -59,33 +61,20 @@ def calculate_indicators(df):
     l = df["Low"]
     v = df["Volume"]
 
-    # -----------------------------
     # 이동평균
-    # -----------------------------
-
     df["MA5"] = c.rolling(5).mean()
     df["MA20"] = c.rolling(20).mean()
     df["MA60"] = c.rolling(60).mean()
 
-    # -----------------------------
-    # 볼린저 밴드
-    # -----------------------------
-
+    # 볼린저
     std20 = c.rolling(20).std()
 
-    df["BB_UPPER"] = df["MA20"] + std20 * 2
     df["BB_LOWER"] = df["MA20"] - std20 * 2
 
-    # -----------------------------
-    # 거래량 평균
-    # -----------------------------
-
+    # 거래량
     df["VMA20"] = v.rolling(20).mean()
 
-    # -----------------------------
     # RSI
-    # -----------------------------
-
     delta = c.diff()
 
     gain = delta.clip(lower=0)
@@ -98,98 +87,37 @@ def calculate_indicators(df):
 
     df["RSI"] = 100 - (100 / (1 + rs))
 
-    # -----------------------------
     # MACD
-    # -----------------------------
-
     ema12 = c.ewm(span=12, adjust=False).mean()
     ema26 = c.ewm(span=26, adjust=False).mean()
 
     df["MACD"] = ema12 - ema26
-    df["MACD_SIGNAL"] = df["MACD"].ewm(span=9, adjust=False).mean()
+    df["MACD_SIGNAL"] = df["MACD"].ewm(
+        span=9,
+        adjust=False
+    ).mean()
 
-    # -----------------------------
     # 이격도
-    # -----------------------------
-
-    df["DISPARITY20"] = (c / df["MA20"]) * 100
-
-    # -----------------------------
-    # ADX
-    # 추세 강도 측정
-    # -----------------------------
-
-    plus_dm = h.diff()
-    minus_dm = l.diff() * -1
-
-    plus_dm = np.where(
-        (plus_dm > minus_dm) & (plus_dm > 0),
-        plus_dm,
-        0
-    )
-
-    minus_dm = np.where(
-        (minus_dm > plus_dm) & (minus_dm > 0),
-        minus_dm,
-        0
-    )
-
-    tr1 = h - l
-    tr2 = abs(h - c.shift())
-    tr3 = abs(l - c.shift())
-
-    tr = pd.concat(
-        [
-            tr1,
-            tr2,
-            tr3
-        ],
-        axis=1
-    ).max(axis=1)
-
-    atr = tr.rolling(14).mean()
-
-    plus_di = 100 * (
-        pd.Series(plus_dm, index=df.index)
-        .rolling(14)
-        .mean() / atr
-    )
-
-    minus_di = 100 * (
-        pd.Series(minus_dm, index=df.index)
-        .rolling(14)
-        .mean() / atr
-    )
-
-    dx = (
-        abs(plus_di - minus_di)
-        / (plus_di + minus_di)
+    df["DISPARITY20"] = (
+        c / df["MA20"]
     ) * 100
 
-    df["ADX"] = dx.rolling(14).mean()
-
-    # -----------------------------
-    # 일목균형표 전환선
-    # -----------------------------
-
-    df["TENKAN"] = (
-        h.rolling(9).max()
-        + l.rolling(9).min()
-    ) / 2
+    # 거래량 추세
+    df["VOL_RATIO"] = (
+        df["Volume"] / df["VMA20"]
+    )
 
     return df
 
 # =========================================================
-# 캔들 분석
+# 캔들 강도
 # =========================================================
-
-def is_bullish_candle(row):
-
-    return row["Close"] > row["Open"]
 
 def candle_strength(row):
 
-    body = abs(row["Close"] - row["Open"])
+    body = abs(
+        row["Close"] - row["Open"]
+    )
 
     total = row["High"] - row["Low"]
 
@@ -199,7 +127,7 @@ def candle_strength(row):
     return body / total
 
 # =========================================================
-# 점수 기반 분석
+# 분석 로직
 # =========================================================
 
 def analyze_logic(ticker, df, name):
@@ -211,14 +139,39 @@ def analyze_logic(ticker, df, name):
 
     curr = df.iloc[-1]
     prev = df.iloc[-2]
-    d2 = df.iloc[-3]
+
+    # =====================================================
+    # 이미 급등한 종목 제외
+    # =====================================================
+
+    change = (
+        (curr["Close"] / prev["Close"]) - 1
+    ) * 100
+
+    if change >= MAX_DAILY_CHANGE:
+        return None
+
+    # =====================================================
+    # 유동성 부족 제외
+    # =====================================================
+
+    avg_volume_money = (
+        curr["Volume"] * curr["Close"]
+    )
+
+    if avg_volume_money < 5000000000:
+        return None
+
+    # =====================================================
+    # 점수 계산
+    # =====================================================
 
     score = 0
-    reasons = []
+    tags = []
 
-    # =====================================================
-    # 1. 바닥권 여부
-    # =====================================================
+    # -----------------------------------------------------
+    # 1. BB 하단
+    # -----------------------------------------------------
 
     bb_near = (
         prev["Close"]
@@ -227,43 +180,36 @@ def analyze_logic(ticker, df, name):
 
     if bb_near:
         score += 15
-        reasons.append("BB하단")
+        tags.append("BB")
 
-    oversold = curr["DISPARITY20"] < 92
-
-    if oversold:
-        score += 10
-        reasons.append("과매도")
-
-    # =====================================================
+    # -----------------------------------------------------
     # 2. RSI 반등
-    # =====================================================
+    # -----------------------------------------------------
 
     rsi_rebound = (
-        prev["RSI"] < 35
+        prev["RSI"] < 38
         and curr["RSI"] > prev["RSI"]
     )
 
     if rsi_rebound:
-        score += 15
-        reasons.append("RSI반등")
+        score += 20
+        tags.append("RSI")
 
-    # =====================================================
+    # -----------------------------------------------------
     # 3. 거래량 증가
-    # =====================================================
+    # -----------------------------------------------------
 
     volume_surge = (
-        curr["Volume"]
-        > curr["VMA20"] * 1.3
+        curr["VOL_RATIO"] >= 1.3
     )
 
     if volume_surge:
         score += 20
-        reasons.append("거래량증가")
+        tags.append("VOL")
 
-    # =====================================================
-    # 4. MACD 골든크로스
-    # =====================================================
+    # -----------------------------------------------------
+    # 4. MACD 상승 전환
+    # -----------------------------------------------------
 
     macd_cross = (
         prev["MACD"]
@@ -274,105 +220,84 @@ def analyze_logic(ticker, df, name):
 
     if macd_cross:
         score += 20
-        reasons.append("MACD상승")
+        tags.append("MACD")
 
-    # =====================================================
+    # -----------------------------------------------------
     # 5. 양봉
-    # =====================================================
+    # -----------------------------------------------------
 
-    bullish = is_bullish_candle(curr)
+    bullish = (
+        curr["Close"] > curr["Open"]
+    )
 
     if bullish:
         score += 10
-        reasons.append("양봉")
 
-    # =====================================================
+    # -----------------------------------------------------
     # 6. 장대양봉
-    # =====================================================
+    # -----------------------------------------------------
 
-    strong_candle = candle_strength(curr) > 0.6
-
-    if strong_candle:
+    if candle_strength(curr) > 0.6:
         score += 10
-        reasons.append("장대양봉")
+        tags.append("CANDLE")
 
-    # =====================================================
-    # 7. MA 정배열
-    # =====================================================
+    # -----------------------------------------------------
+    # 7. 정배열 초기
+    # -----------------------------------------------------
 
-    trend = (
-        curr["MA5"]
-        > curr["MA20"]
-        > curr["MA60"]
+    ma_turn = (
+        curr["MA5"] > curr["MA20"]
+        and prev["MA5"] <= prev["MA20"]
     )
 
-    if trend:
-        score += 15
-        reasons.append("정배열")
+    if ma_turn:
+        score += 20
+        tags.append("GC")
 
-    # =====================================================
-    # 8. MA 골든크로스
-    # =====================================================
+    # -----------------------------------------------------
+    # 8. 과매도
+    # -----------------------------------------------------
 
-    golden_cross = (
-        prev["MA5"] <= prev["MA20"]
-        and curr["MA5"] > curr["MA20"]
+    oversold = (
+        curr["DISPARITY20"] < 94
     )
 
-    if golden_cross:
-        score += 15
-        reasons.append("골든크로스")
-
-    # =====================================================
-    # 9. ADX 상승
-    # =====================================================
-
-    adx_rising = (
-        curr["ADX"] > prev["ADX"]
-        and curr["ADX"] > 20
-    )
-
-    if adx_rising:
+    if oversold:
         score += 10
-        reasons.append("추세강화")
+        tags.append("OS")
 
     # =====================================================
-    # 10. 일목 전환선 돌파
+    # 너무 오른 종목 제외
     # =====================================================
 
-    tenkan_break = curr["Close"] > curr["TENKAN"]
+    # 최근 5일간 25% 이상 상승 제외
 
-    if tenkan_break:
-        score += 10
-        reasons.append("전환선돌파")
+    recent_5d = (
+        (curr["Close"] / df.iloc[-6]["Close"]) - 1
+    ) * 100
 
-    # =====================================================
-    # 점수별 등급
-    # =====================================================
-
-    if score >= 85:
-        grade = "🔥 S급"
-    elif score >= 70:
-        grade = "⭐ A급"
-    elif score >= 55:
-        grade = "✅ B급"
-    else:
+    if recent_5d >= 25:
         return None
 
+    # =====================================================
+    # 최소 점수
+    # =====================================================
+
+    if score < MIN_SCORE:
+        return None
+
+    # =====================================================
+    # 결과
+    # =====================================================
+
     return {
-        "ticker": ticker,
         "name": name,
         "score": score,
-        "grade": grade,
         "price": curr["Close"],
-        "change": (
-            (curr["Close"] / prev["Close"]) - 1
-        ) * 100,
+        "change": change,
         "rsi": curr["RSI"],
-        "volume_ratio": (
-            curr["Volume"] / curr["VMA20"]
-        ),
-        "reasons": ", ".join(reasons)
+        "vol": curr["VOL_RATIO"],
+        "tags": ",".join(tags)
     }
 
 # =========================================================
@@ -398,15 +323,10 @@ def process_market(
             progress=False
         )
 
-    except Exception as e:
-
-        send_telegram(
-            f"{market_name} 다운로드 실패\n{e}"
-        )
-
+    except Exception:
         return
 
-    candidates = []
+    results = []
 
     for ticker in tickers:
 
@@ -421,81 +341,72 @@ def process_market(
             )
 
             if result:
-                candidates.append(result)
+                results.append(result)
 
-        except Exception:
+        except:
             continue
 
     # =====================================================
-    # 점수 기준 정렬
+    # 점수순 정렬
     # =====================================================
 
-    candidates = sorted(
-        candidates,
+    results = sorted(
+        results,
         key=lambda x: (
             -x["score"],
             x["rsi"]
         )
     )
 
-    now = datetime.utcnow() + timedelta(hours=9)
-
-    flag = "🇰🇷" if market_name == "KOREA" else "🇺🇸"
-    cur = "₩" if market_name == "KOREA" else "$"
-
-    # =====================================================
-    # 결과 없음
-    # =====================================================
-
-    if not candidates:
-
-        send_telegram(
-            f"{flag} [{market_name}] 조건 부합 종목 없음"
-        )
-
-        return
-
     # =====================================================
     # 메시지 생성
     # =====================================================
 
-    msg = (
-        f"{flag} *[{market_name} 바닥 반등 분석]*\n"
-        f"{now.strftime('%Y-%m-%d %H:%M')}\n"
-        f"===================="
+    flag = (
+        "🇰🇷"
+        if market_name == "KOREA"
+        else "🇺🇸"
     )
 
-    # S/A/B 그룹
+    cur = (
+        "₩"
+        if market_name == "KOREA"
+        else "$"
+    )
 
-    groups = [
-        "🔥 S급",
-        "⭐ A급",
-        "✅ B급"
-    ]
+    now = (
+        datetime.utcnow()
+        + timedelta(hours=9)
+    ).strftime("%m/%d %H:%M")
 
-    for grade in groups:
+    # 결과 없음
 
-        filtered = [
-            x for x in candidates
-            if x["grade"] == grade
-        ]
+    if not results:
 
-        if not filtered:
-            continue
+        send_telegram(
+            f"{flag} {market_name}\n조건 부합 종목 없음"
+        )
 
-        msg += f"\n\n{grade}\n"
+        return
 
-        for s in filtered[:10]:
+    # 간단한 형태
 
-            msg += (
-                f"\n• {s['name']}"
-                f"\n  점수: {s['score']}점"
-                f"\n  가격: {cur}{s['price']:,.0f}"
-                f"\n  등락: {s['change']:+.2f}%"
-                f"\n  RSI: {s['rsi']:.1f}"
-                f"\n  거래량: {s['volume_ratio']:.1f}배"
-                f"\n  신호: {s['reasons']}\n"
-            )
+    msg = (
+        f"{flag} {market_name} "
+        f"바닥반등 후보 ({now})\n\n"
+    )
+
+    for r in results[:15]:
+
+        msg += (
+            f"{r['name']}  "
+            f"[{r['score']}]\n"
+            f"{cur}{r['price']:,.0f}  "
+            f"{r['change']:+.1f}%  "
+            f"RSI:{r['rsi']:.0f}  "
+            f"V:{r['vol']:.1f}x\n"
+            f"{r['tags']}\n\n"
+        )
 
     send_telegram(msg)
 
@@ -506,10 +417,8 @@ def process_market(
 def main():
 
     # =====================================================
-    # 한국 시장
+    # 한국
     # =====================================================
-
-    print("한국 시장 로딩")
 
     kor = (
         fdr.StockListing("KRX")
@@ -548,14 +457,13 @@ def main():
     )
 
     # =====================================================
-    # 미국 시장
+    # 미국
     # =====================================================
 
-    print("미국 시장 로딩")
-
-    us = fdr.StockListing("S&P500")
-
-    us = us.head(USA_TOP_N)
+    us = (
+        fdr.StockListing("S&P500")
+        .head(USA_TOP_N)
+    )
 
     us_tickers = [
         t.replace(".", "-")
