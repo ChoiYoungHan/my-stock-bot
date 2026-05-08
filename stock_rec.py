@@ -22,99 +22,106 @@ def send_telegram(msg):
 
 def calculate_indicators(df):
     c, h, l, v = df['Close'], df['High'], df['Low'], df['Volume']
+    # 이동평균선
     df['MA5'], df['MA20'], df['MA60'] = c.rolling(5).mean(), c.rolling(20).mean(), c.rolling(60).mean()
     df['V_MA20'] = v.rolling(20).mean()
-    std = c.rolling(20).std()
-    df['BB_L'] = df['MA20'] - (std * 2)
     
-    # CCI 및 RSI
+    # 지표들
     tp = (h + l + c) / 3
     df['CCI'] = (tp - tp.rolling(14).mean()) / (0.015 * tp.rolling(14).apply(lambda x: np.fabs(x - x.mean()).mean()))
+    
     delta = c.diff()
     up, down = delta.copy(), delta.copy()
     up[up < 0], down[down > 0] = 0, 0
     df['RSI'] = 100 - (100 / (1 + (up.ewm(13).mean() / down.abs().ewm(13).mean())))
     
-    # 박스권 분석용 (60일 최고가)
+    # 박스권/피보나치
     df['Max_60'] = h.shift(1).rolling(60).max()
-    # 피보나치
     df['High_6m'] = h.rolling(120).max()
     df['Low_6m'] = l.rolling(120).min()
     
     return df
 
 def analyze_logic(ticker, df, name):
-    if len(df) < 120: return None
+    if len(df) < 120: return []
     df = calculate_indicators(df)
     
     curr, prev, d2 = df.iloc[-1], df.iloc[-2], df.iloc[-3]
-    reasons = []
+    matches = []
 
-    # 1. 박스권 돌파 후 지지 (BOX_RETEST)
-    # 최근 20일 내 돌파 발생 여부 확인
+    # 1. 박스권 돌파 후 지지 (Retest)
     recent_20 = df.iloc[-20:-1]
-    breakout_occured = any(recent_20['Close'] > recent_20['Max_60'])
-    if breakout_occured:
-        # 현재 주가가 과거 저항선(Max_60) 부근에 도달했는지 (-2% ~ +3% 오차)
+    if any(recent_20['Close'] > recent_20['Max_60']):
         support_line = curr['Max_60']
         if support_line * 0.98 <= curr['Close'] <= support_line * 1.03:
-            reasons.append("박스권 돌파 후 지지선 안착")
+            matches.append("박스권 돌파 후 지지선 안착")
 
     # 2. 피보나치 0.618 반등
     fibo_618 = curr['High_6m'] - (curr['High_6m'] - curr['Low_6m']) * 0.618
     if prev['Close'] < fibo_618 and curr['Close'] > curr['Open']:
-        reasons.append("피보나치 0.618 반등")
+        matches.append("피보나치 0.618 반등 구간")
 
-    # 3. CCI 과매도 탈출
+    # 3. CCI 바닥 탈출
     if prev['CCI'] < -100 and curr['CCI'] > -100:
-        reasons.append("CCI 바닥 탈출")
+        matches.append("CCI 과매도 탈출 (추세 반전)")
 
     # 4. 도지 변곡
     o, h, l, c = prev['Open'], prev['High'], prev['Low'], prev['Close']
     body = abs(c - o)
     is_true_doji = (body <= (h-l)*0.25) and (h-max(o,c) > body) and (min(o,c)-l > body) if (h-l)>0 else False
     if (d2['Close'] > prev['Close']) and is_true_doji and (curr['Close'] > curr['Open']):
-        reasons.append("도지 캔들 변곡")
+        matches.append("하락 끝 도지 캔들 변곡")
 
     # 5. 정배열 초입
     if not (prev['MA5'] > prev['MA20'] > prev['MA60']) and (curr['MA5'] > curr['MA20'] > curr['MA60']):
-        reasons.append("정배열 초입 진입")
+        matches.append("이평선 정배열 초입 진입")
 
     # 6. RSI 과매도 반등
     if prev['RSI'] < 30 and curr['Close'] > curr['Open']:
-        reasons.append("RSI 과매도 반등")
+        matches.append("RSI 과매도 기술적 반등")
 
-    if not reasons: return None
-
-    return {
-        "name": name, "price": curr['Close'], "change": ((curr['Close']/prev['Close'])-1)*100,
-        "reason": " / ".join(reasons)
-    }
+    results = []
+    for m in matches:
+        results.append({
+            "category": m,
+            "name": name,
+            "price": curr['Close'],
+            "change": ((curr['Close']/prev['Close'])-1)*100
+        })
+    return results
 
 def process_market(market_name, tickers, names):
     print(f"[{market_name}] 분석 중...")
     try: data = yf.download(tickers, period="10mo", group_by='ticker', threads=True, progress=False)
     except: return
     
-    found = []
+    category_map = {}
     for t in tickers:
         try:
             df = data[t].dropna()
-            res = analyze_logic(t, df, names[t])
-            if res: found.append(res)
+            res_list = analyze_logic(t, df, names[t])
+            for res in res_list:
+                cat = res['category']
+                if cat not in category_map: category_map[cat] = []
+                category_map[cat].append(res)
         except: continue
 
-    found.sort(key=lambda x: -abs(x['change']))
     now = datetime.utcnow() + timedelta(hours=9)
     header, cur_symbol = ("🇰🇷", "₩") if market_name == "KOREA" else ("🇺🇸", "$")
 
-    if not found:
-        send_telegram(f"{header} **[{market_name}]** 현재 조건 부합 종목 없음")
+    if not category_map:
+        send_telegram(f"{header} **[{market_name}]** 부합 종목 없음")
         return
 
-    msg = f"{header} **[{market_name} 추세 리포트]**\n{now.strftime('%m/%d %H:%M')}\n\n"
-    for i, s in enumerate(found[:15]): # 최대 15개 출력
-        msg += f"{i+1}. **{s['name']}** ({cur_symbol}{s['price']:,.0f}, {s['change']:+.2f}%) 🔵 _{s['reason']}_\n"
+    msg = f"{header} **[{market_name} 추세 분석 리포트]**\n{now.strftime('%m/%d %H:%M')}\n"
+    msg += "---"
+    
+    for cat, stocks in category_map.items():
+        msg += f"\n\n🔵 **{cat}**\n"
+        # 등락률 순 정렬 후 최대 7개만 표시
+        stocks.sort(key=lambda x: -abs(x['change']))
+        for s in stocks[:7]:
+            msg += f"└ {s['name']} ({cur_symbol}{s['price']:,.0f}, {s['change']:+.2f}%)\n"
     
     send_telegram(msg)
 
