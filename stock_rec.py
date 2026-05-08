@@ -10,12 +10,11 @@ import os
 logging.getLogger('yfinance').setLevel(logging.CRITICAL)
 
 # --- [1. 설정 및 파라미터] ---
-# GitHub Actions의 Secrets 또는 시스템 환경변수에서 값을 가져옵니다.
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 def send_telegram(msg):
-    """텔레그램 메시지 전송 함수"""
+    """텔레그램 메시지 전송 함수埋"""
     if not (TOKEN and CHAT_ID):
         print("에러: TELEGRAM_TOKEN 또는 TELEGRAM_CHAT_ID 환경변수가 설정되지 않았습니다.")
         return
@@ -38,6 +37,7 @@ def calculate_indicators(df):
     df['MA60'] = c.rolling(60).mean()
     df['V_MA20'] = v.rolling(20).mean()
     
+    # 불린저 밴드 계산 (20일, 2표준편차)
     std = c.rolling(20).std()
     df['BB_U'], df['BB_L'] = df['MA20'] + (std * 2), df['MA20'] - (std * 2)
     
@@ -72,13 +72,11 @@ def analyze_logic(ticker, df, name):
     if len(df) < 60: return None, None
     df = calculate_indicators(df)
     
-    # 분석 데이터 추출
     curr = df.iloc[-1]
     prev = df.iloc[-2]
     d2 = df.iloc[-3]
     d3 = df.iloc[-4]
     
-    # 캔들 분석 결과
     candle_type = analyze_candle(curr)
 
     res = {
@@ -89,19 +87,21 @@ def analyze_logic(ticker, df, name):
         "candle": candle_type
     }
     
-    # --- [전략 1: 3일 하락 후 장악형 패턴] ---
-    # 최근 3일간 종가 하락 (T-3 > T-2 > T-1)
+    # --- [전략 1: 불린저 하단 + 3일 하락 후 장악형 패턴] ---
+    # 1. 최근 3일간 종가 하락 (T-3 > T-2 > T-1)
     is_falling = (d3['Close'] > d2['Close']) and (d2['Close'] > prev['Close'])
-    # 전일 음봉 & 금일 양봉
+    # 2. 전일 음봉 & 금일 양봉
     was_bearish = prev['Open'] > prev['Close']
     is_bullish = curr['Close'] > curr['Open']
-    # 장악 조건: 금일 종가가 전일 시가 이상
+    # 3. 장악 조건: 금일 종가가 전일 시가 이상
     is_engulfing = curr['Close'] >= prev['Open']
+    # 4. 바닥권 조건: 전일 종가가 BB 하단 2% 이내 혹은 금일 저가가 BB 하단 이하(터치)
+    is_near_bb_bottom = (prev['Close'] <= prev['BB_L'] * 1.02) or (curr['Low'] <= curr['BB_L'])
 
-    if is_falling and was_bearish and is_bullish and is_engulfing:
+    if is_falling and was_bearish and is_bullish and is_engulfing and is_near_bb_bottom:
         return "ENGULFING", res
 
-    # --- 기존 공통 필터 ---
+    # --- 기존 공통 필터 (거래량) ---
     is_korea = ".K" in ticker
     vol_threshold = 1.2 if is_korea else 0.5
     if curr['Volume'] < curr['V_MA20'] * vol_threshold: 
@@ -158,15 +158,15 @@ def process_market(market_name, tickers, names):
     
     send_telegram(output)
 
-    # 2. 캔들 패턴(ENGULFING) 별도 메시지 전송
+    # 2. 불린저 하단 장악형(ENGULFING) 별도 메시지 전송
     if storage["ENGULFING"]:
-        eng_msg = f"{header} **[{market_name}] 역전환 캔들 포착**\n"
-        eng_msg += "*(3일 연속 하락 후 전일 음봉 몸통 장악)*\n\n"
+        eng_msg = f"{header} **[{market_name}] 바닥권 역전환 포착**\n"
+        eng_msg += "*(BB하단 근처 + 3일 하락 후 장악형)*\n\n"
         for i in storage["ENGULFING"]:
             candle_tag = f" `{i['candle']}`" if i['candle'] else ""
-            eng_msg += f"🔥 **{i['name']}**\n"
+            eng_msg += f"⭐ **{i['name']}**\n"
             eng_msg += f"└ 현재가: {cur_symbol}{i['price']:,.0f} ({i['change']:+.2f}%)\n"
-            eng_msg += f"└ 특이사항: {candle_tag if candle_tag else '역전세 발생'}\n\n"
+            eng_msg += f"└ 특이사항: {candle_tag if candle_tag else '바닥 지지 및 장악'}\n\n"
         send_telegram(eng_msg)
 
 def main():
