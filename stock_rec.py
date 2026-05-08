@@ -58,60 +58,63 @@ def analyze_logic(ticker, df, name):
         "change": ((curr['Close']/prev['Close'])-1)*100
     }
     
-    # 기본 조건: 전일 하락 흐름 및 당일 양봉
+    # 기본 조건
     is_prev_falling = d2['Close'] > prev['Close']
     is_today_bullish = curr['Close'] > curr['Open']
     is_near_bottom = (prev['Close'] <= prev['BB_L'] * 1.05) # BB하단 5% 이내
     
-    # --- [도지 캔들 상세 판별 로직] ---
+    # --- [도지 캔들 상세 판별: 위아래 꼬리가 몸통보다 길어야 함] ---
     o, h, l, c = prev['Open'], prev['High'], prev['Low'], prev['Close']
     body = abs(c - o)
     upper_tail = h - max(o, c)
     lower_tail = min(o, c) - l
     total_range = h - l
     
-    # 1. 몸통이 전체 변동폭의 20% 이하 (매우 작음)
-    is_small_body = (body <= total_range * 0.20) if total_range > 0 else False
-    # 2. 위꼬리가 몸통보다 길어야 함
+    is_small_body = (body <= total_range * 0.25) if total_range > 0 else False
     is_upper_tail_long = upper_tail > body
-    # 3. 아래꼬리가 몸통보다 길어야 함
     is_lower_tail_long = lower_tail > body
     
     is_true_doji = is_small_body and is_upper_tail_long and is_lower_tail_long
 
-    # --- [전략 적용] ---
+    # 1. 변곡점 전략 (REVERSAL / ANY_DOJI)
     if is_prev_falling and is_true_doji and is_today_bullish and is_near_bottom:
-        # 전일 도지가 양봉인 경우 (강력 변곡)
         if prev['Close'] > prev['Open']:
             return "REVERSAL", res
-        # 전일 도지가 음봉인 경우 (일반 변곡)
         else:
             return "ANY_DOJI", res
 
-    # --- 공통 필터 및 기타 전략 ---
+    # --- 공통 필터 ---
     if curr['Volume'] < curr['V_MA20'] * 0.4:
         return None, None
 
+    # 2. 골든크로스 (5일/20일)
     if (df['MA5'].iloc[-2] <= df['MA20'].iloc[-2]) and (df['MA5'].iloc[-1] > df['MA20'].iloc[-1]):
         return "CROSS", res
+
+    # 3. 바닥 반등 (BB 하단 지지 후 양봉) - 복구됨
+    if prev['Close'] < prev['BB_L'] * 1.03 and curr['Close'] > curr['Open']:
+        return "REBOUND", res
+
+    # 4. 상승추세 (정배열)
     if curr['MA5'] > curr['MA20'] > curr['MA60'] and curr['Close'] > curr['Tenkan']:
         return "TREND", res
             
     return None, None
 
 def process_market(market_name, tickers, names):
-    print(f"[{market_name}] 분석 시작...")
+    print(f"[{market_name}] 분석 시작... (대상: {len(tickers)}개)")
     try:
+        # 대량 종목 다운로드를 위해 threads 활성화
         data = yf.download(tickers, period="6mo", group_by='ticker', threads=True, progress=False)
     except Exception as e:
         print(f"다운로드 실패: {e}")
         return
     
-    storage = {"TREND": [], "CROSS": [], "REVERSAL": [], "ANY_DOJI": []}
+    storage = {"TREND": [], "REBOUND": [], "CROSS": [], "REVERSAL": [], "ANY_DOJI": []}
     for ticker in tickers:
         try:
             df = data[ticker].dropna() if len(tickers) > 1 else data.dropna()
-            if df.empty or len(df) < 15: continue
+            if df.empty or len(df) < 20: continue
             cat, res = analyze_logic(ticker, df, names[ticker])
             if cat: storage[cat].append(res)
         except: continue
@@ -120,37 +123,39 @@ def process_market(market_name, tickers, names):
     header = "🇰🇷" if market_name == "KOREA" else "🇺🇸"
     cur_symbol = "₩" if market_name == "KOREA" else "$"
     
-    # 1. 통합 리포트
+    # 1. 메인 리포트 (추세, 반등, 골든크로스)
     output = f"{header} **[{market_name} 시장 리포트]**\n분석: {now_kst.strftime('%m/%d %H:%M')}\n\n"
-    for key, title in [("TREND", "🚀 상승추세"), ("CROSS", "✨ 골든크로스")]:
+    for key, title in [("TREND", "🚀 상승추세"), ("REBOUND", "⚓ 바닥반등"), ("CROSS", "✨ 골든크로스")]:
         output += f"{title}\n"
         items = sorted(storage[key], key=lambda x: abs(x['change']), reverse=True)[:5]
-        output += ("\n".join([f"└ {i['name']} ({cur_symbol}{i['price']:,.0f}, {i['change']:+.2f}%)" for i in items]) if items else "└ 없음") + "\n\n"
+        if items:
+            for i in items:
+                output += f"└ {i['name']} ({cur_symbol}{i['price']:,.0f}, {i['change']:+.2f}%)\n"
+        else:
+            output += "└ 없음\n"
+        output += "\n"
     send_telegram(output)
 
-    # 2. 변곡점 리포트 (꼬리 조건 강화 버전)
-    rev_found = False
-    rev_msg = f"{header} **[{market_name}] 꼬리 긴 도지 변곡**\n"
-    
+    # 2. 변곡점 리포트 (꼬리 긴 도지)
     combined_rev = storage["REVERSAL"] + storage["ANY_DOJI"]
     if combined_rev:
-        rev_found = True
+        rev_msg = f"{header} **[{market_name}] 꼬리 긴 도지 변곡**\n*(하락 후 지지 확인)*\n\n"
         for i in combined_rev:
             tag = "🔥양봉도지" if i in storage["REVERSAL"] else "⚖️음봉도지"
             rev_msg += f"└ {i['name']} ({cur_symbol}{i['price']:,.0f}) [{tag}]\n"
-
-    if rev_found:
         send_telegram(rev_msg)
     else:
-        send_telegram(f"{header} **[{market_name}]** 꼬리 긴 도지 반등 종목이 없습니다.")
+        send_telegram(f"{header} **[{market_name}]** 현재 도지 변곡 조건을 만족하는 종목이 없습니다.")
 
 def main():
+    # 한국 시장 - 상위 500개로 확대
     try:
-        kor_listing = fdr.StockListing('KRX').sort_values('Marcap', ascending=False).head(300)
+        kor_listing = fdr.StockListing('KRX').sort_values('Marcap', ascending=False).head(500)
         kor_tickers = [row['Code'] + (".KS" if row['Market'] == 'KOSPI' else ".KQ") for _, row in kor_listing.iterrows()]
         process_market("KOREA", kor_tickers, dict(zip(kor_tickers, kor_listing['Name'])))
     except Exception as e: print(f"한국 오류: {e}")
 
+    # 미국 시장 - S&P 500
     try:
         us_listing = fdr.StockListing('S&P500')
         us_tickers = [t.replace('.', '-') for t in us_listing['Symbol']]
