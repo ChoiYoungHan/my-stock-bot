@@ -46,16 +46,20 @@ def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df["MA20"] = c.rolling(20).mean()
     std20 = c.rolling(20).std()
     df["BB_LOWER"] = df["MA20"] - std20 * 2
+    
     delta = c.diff()
     gain = delta.clip(lower=0).rolling(14).mean()
     loss = (-delta.clip(upper=0)).rolling(14).mean()
     df["RSI"] = 100 - (100 / (1 + (gain / (loss + 1e-9))))
+    
     ema12, ema26 = c.ewm(span=12).mean(), c.ewm(span=26).mean()
     df["MACD"] = ema12 - ema26
     df["MACD_SIG"] = df["MACD"].ewm(span=9).mean()
+    
     low14, high14 = l.rolling(14).min(), h.rolling(14).max()
     df["STOCH_K"] = (c - low14) / (high14 - low14 + 1e-9) * 100
     df["STOCH_D"] = df["STOCH_K"].rolling(3).mean()
+    
     df["VMA20"] = v.rolling(20).mean()
     df["VOL_RATIO"] = v / (df["VMA20"] + 1e-9)
     return df
@@ -64,6 +68,7 @@ def analyze_logic(ticker: str, df: pd.DataFrame, name: str, market: str) -> Opti
     if len(df) < 50: return None
     df = calculate_indicators(df)
     curr, prev = df.iloc[-1], df.iloc[-2]
+    
     change = ((curr["Close"] / prev["Close"]) - 1) * 100
     if change >= 10.0: return None
     
@@ -96,7 +101,9 @@ def process_market(market_name: str, tickers: list, names: dict):
         try:
             df = data[ticker].dropna() if len(tickers) > 1 else data.dropna()
             if df.empty: continue
-            res = analyze_logic(ticker, df, names.get(ticker, ticker), market_name)
+            # names 딕셔너리에서 이름을 가져오되, 없으면 티커 표시
+            display_name = names.get(ticker, ticker)
+            res = analyze_logic(ticker, df, display_name, market_name)
             if res: results.append(res)
         except: continue
 
@@ -113,8 +120,9 @@ def process_market(market_name: str, tickers: list, names: dict):
         safe_name = html.escape(r["name"])
         tag_str = " ".join([f"#{t}" for t in r["tags"]])
         unit = "₩" if market_name == "KOREA" else "$"
+        # :.0f 포맷을 사용하여 뒤의 .00을 제거합니다.
         msg += f"{i+1}. <b>{safe_name}</b> ({r['score']}점)\n"
-        msg += f"└ 💰 {unit}{r['price']:,.2f} ({r['change']:+.1f}%) | RSI:{r['rsi']:.0f}\n"
+        msg += f"└ 💰 {unit}{r['price']:,.0f} ({r['change']:+.1f}%) | RSI:{r['rsi']:.0f}\n"
         msg += f"└ 📊 {tag_str}\n\n"
     
     send_telegram(msg)
@@ -127,13 +135,19 @@ def main():
         process_market("KOREA", kor_tickers, dict(zip(kor_tickers, kor["Name"])))
     except Exception as e: print(f"KOREA Error: {e}")
 
-    # 2. 미국 (한글 명칭 매핑 추가)
+    # 2. 미국 (S&P500 한글명 매핑 보완)
     try:
         us = fdr.StockListing("S&P500").head(USA_TOP_N)
-        # yfinance용 티커 리스트 ( . -> - 변환)
-        us_tickers = [str(t).replace(".", "-") for t in us["Symbol"]]
-        # 한글 이름을 변환된 티커에 맞춰 딕셔너리 생성
-        us_names = {str(row["Symbol"]).replace(".", "-"): row["Name"] for _, row in us.iterrows()}
+        us_names = {}
+        us_tickers = []
+        
+        for _, row in us.iterrows():
+            # yfinance 호환 티커 생성
+            clean_ticker = str(row["Symbol"]).replace(".", "-")
+            us_tickers.append(clean_ticker)
+            # 이름이 결측치인 경우 티커로 대체
+            h_name = row["Name"] if pd.notna(row["Name"]) else row["Symbol"]
+            us_names[clean_ticker] = h_name
         
         process_market("USA", us_tickers, us_names)
     except Exception as e: print(f"USA Error: {e}")
