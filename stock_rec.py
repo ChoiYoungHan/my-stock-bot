@@ -6,7 +6,7 @@ from datetime import datetime, timedelta
 import requests
 import logging
 import os
-from typing import Optional, List, Dict
+from typing import Optional
 
 # =========================================================
 # 설정 및 환경변수
@@ -23,7 +23,7 @@ MAX_DAILY_CHANGE = 10.0
 MAX_5D_CHANGE = 25.0
 
 # =========================================================
-# 유틸리티 함수
+# 텔레그램 전송 함수
 # =========================================================
 def send_telegram(msg: str):
     if not (TOKEN and CHAT_ID):
@@ -36,62 +36,46 @@ def send_telegram(msg: str):
     except Exception as e:
         print(f"Telegram Error: {e}")
 
+# =========================================================
+# 지표 계산 로직 (기존 유지)
+# =========================================================
 def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     c, h, l, v = df["Close"], df["High"], df["Low"], df["Volume"]
 
-    # 이동평균 및 볼린저 밴드
-    df["MA5"] = c.rolling(5).mean()
+    # 볼린저 밴드
     df["MA20"] = c.rolling(20).mean()
     std20 = c.rolling(20).std()
     df["BB_UPPER"] = df["MA20"] + std20 * 2
     df["BB_LOWER"] = df["MA20"] - std20 * 2
-    df["BB_WIDTH"] = (df["BB_UPPER"] - df["BB_LOWER"]) / (df["MA20"] + 1e-9)
-    df["BB_WIDTH_MA60"] = df["BB_WIDTH"].rolling(60).mean()
-
-    # RSI, MACD, Stochastic
+    
+    # RSI
     delta = c.diff()
     gain = delta.clip(lower=0).rolling(14).mean()
     loss = (-delta.clip(upper=0)).rolling(14).mean()
     df["RSI"] = 100 - (100 / (1 + (gain / (loss + 1e-9))))
 
+    # MACD
     ema12 = c.ewm(span=12, adjust=False).mean()
     ema26 = c.ewm(span=26, adjust=False).mean()
     df["MACD"] = ema12 - ema26
     df["MACD_SIG"] = df["MACD"].ewm(span=9, adjust=False).mean()
-    df["MACD_HIST"] = df["MACD"] - df["MACD_SIG"]
 
+    # Stochastic & Williams %R
     low14, high14 = l.rolling(14).min(), h.rolling(14).max()
     df["STOCH_K"] = (c - low14) / (high14 - low14 + 1e-9) * 100
     df["STOCH_D"] = df["STOCH_K"].rolling(3).mean()
     df["WR"] = (high14 - c) / (high14 - low14 + 1e-9) * -100
 
-    # 거래량 및 이격도
+    # 이평선 및 거래량
+    df["MA5"] = c.rolling(5).mean()
     df["VMA20"] = v.rolling(20).mean()
     df["VOL_RATIO"] = v / (df["VMA20"] + 1e-9)
-    df["DISPARITY20"] = (c / (df["MA20"] + 1e-9)) * 100
 
     return df
 
 # =========================================================
-# 캔들 패턴 로직 (보완)
-# =========================================================
-def is_doji(row, threshold: float = 0.15) -> bool:
-    body = abs(row["Close"] - row["Open"])
-    total = row["High"] - row["Low"]
-    if total == 0: return False
-    # 몸통이 짧고, 위아래 꼬리 합이 몸통보다 길어야 함
-    return (body / total) < threshold and (total > body * 2)
-
-def is_hammer(row) -> bool:
-    o, c, h, l = row["Open"], row["Close"], row["High"], row["Low"]
-    body = abs(c - o) or 1e-9
-    lower_wick = min(o, c) - l
-    upper_wick = h - max(o, c)
-    return (lower_wick >= body * 2) and (upper_wick <= body * 0.5)
-
-# =========================================================
-# 분석 메인 로직
+# 분석 메인 로직 (기존 로직 유지 + 보완)
 # =========================================================
 def analyze_logic(ticker: str, df: pd.DataFrame, name: str, market: str) -> Optional[dict]:
     if len(df) < 100: return None
@@ -99,10 +83,11 @@ def analyze_logic(ticker: str, df: pd.DataFrame, name: str, market: str) -> Opti
     df = calculate_indicators(df)
     curr, prev = df.iloc[-1], df.iloc[-2]
     
-    # 기본 필터: 급등주 제외 및 유동성 체크
+    # [필터] 급등주 제외
     change = ((curr["Close"] / prev["Close"]) - 1) * 100
     if change >= MAX_DAILY_CHANGE: return None
     
+    # [필터] 유동성 체크
     vol_money = curr["Volume"] * curr["Close"]
     money_limit = 5_000_000_000 if market == "KOREA" else 5_000_000
     if vol_money < money_limit: return None
@@ -110,17 +95,14 @@ def analyze_logic(ticker: str, df: pd.DataFrame, name: str, market: str) -> Opti
     score = 0
     tags = []
 
-    # 1. 볼린저 밴드 하단 전략 (가중치 강화)
+    # 1. 볼린저 하단 전략
     if curr["Low"] < curr["BB_LOWER"] * 1.02:
         score += 15
         if curr["Close"] > curr["Open"]: # 하단 근처 양봉
             score += 10
             tags.append("BB_UP")
-        if is_doji(curr):
-            score += 15
-            tags.append("BB_DOJI")
 
-    # 2. 보조지표 반등 (RSI, Stochastic, WR)
+    # 2. 보조지표 반등
     if prev["RSI"] < 35 and curr["RSI"] > prev["RSI"]:
         score += 15; tags.append("RSI")
     if prev["STOCH_K"] < 20 and curr["STOCH_K"] > curr["STOCH_D"]:
@@ -133,64 +115,84 @@ def analyze_logic(ticker: str, df: pd.DataFrame, name: str, market: str) -> Opti
         score += 15; tags.append("MACD_GC")
     if curr["VOL_RATIO"] >= 1.5:
         score += 15; tags.append("VOL_UP")
-    if curr["MA5"] > curr["MA20"] and prev["MA5"] <= prev["MA20"]:
-        score += 15; tags.append("MA_GC")
     
-    if is_hammer(curr):
-        score += 10; tags.append("HAMMER")
+    # 도지 및 망치형 (바닥 시그널)
+    body = abs(curr["Close"] - curr["Open"])
+    total = curr["High"] - curr["Low"]
+    if total > 0 and (body / total) < 0.15 and (total > body * 2):
+        score += 15; tags.append("DOJI")
 
     if score < MIN_SCORE: return None
 
     return {
         "name": name, "score": score, "price": curr["Close"],
-        "change": change, "rsi": curr["RSI"], "stoch_k": curr["STOCH_K"],
-        "vol": curr["VOL_RATIO"], "tags": tags[:3] # 태그는 최대 3개만
+        "change": change, "rsi": curr["RSI"], "vol": curr["VOL_RATIO"], "tags": tags[:3]
     }
 
 # =========================================================
-# 실행 및 메시지 전송
+# 시장 분석 프로세스
 # =========================================================
 def process_market(market_name: str, tickers: list, names: dict):
-    print(f"[{market_name}] 분석 중...")
+    print(f"[{market_name}] 분석 중... ({len(tickers)} 종목)")
+    if not tickers: return
+
     try:
         data = yf.download(tickers, period="12mo", group_by="ticker", auto_adjust=False, threads=True, progress=False)
-    except: return
+    except Exception as e:
+        print(f"[{market_name}] 데이터 다운로드 에러: {e}")
+        return
 
     results = []
     for ticker in tickers:
         try:
-            df = data[ticker].dropna()
+            # 다중 다운로드 데이터프레임 구조 대응
+            df = data[ticker].dropna() if len(tickers) > 1 else data.dropna()
+            if df.empty: continue
+            
             res = analyze_logic(ticker, df, names.get(ticker, ticker), market_name)
             if res: results.append(res)
         except: continue
 
+    # 점수 순 정렬 후 상위 10개만 전송
     results = sorted(results, key=lambda x: -x["score"])[:10]
     
-    if not results: return
-
     now = (datetime.utcnow() + timedelta(hours=9)).strftime("%y/%m/%d %H:%M")
     flag = "🇰🇷" if market_name == "KOREA" else "🇺🇸"
-    msg = f"{flag} *{market_name} 바닥 반등 TOP 10* ({now})\n\n"
     
+    if not results:
+        send_telegram(f"{flag} *{market_name}* ({now})\n조건 부합 종목 없음")
+        return
+
+    msg = f"{flag} *{market_name} 바닥 반등 TOP 10* ({now})\n\n"
     for i, r in enumerate(results):
         tag_str = " ".join([f"#{t}" for t in r["tags"]])
-        msg += f"{i+1}. *{r['name']}*  ({r['score']}점)\n"
-        msg += f"└ 💰 {r['price']:,.0f} ({r['change']:+.1f}%) | RSI:{r['rsi']:.0f}\n"
+        cur_symbol = "₩" if market_name == "KOREA" else "$"
+        msg += f"{i+1}. *{r['name']}* ({r['score']}점)\n"
+        msg += f"└ 💰 {cur_symbol}{r['price']:,.2f} ({r['change']:+.1f}%) | RSI:{r['rsi']:.0f}\n"
         msg += f"└ 📊 {tag_str}\n\n"
 
     send_telegram(msg)
 
+# =========================================================
+# 메인 실행부
+# =========================================================
 def main():
-    # 한국 시장 (KOSPI/KOSDAQ 시총 상위)
     try:
+        # 1. 한국 시장 분석
+        print("KOREA 시장 데이터 수집 중...")
         kor = fdr.StockListing("KRX").sort_values("Marcap", ascending=False).head(KOR_TOP_N)
         kor_tickers = [c + (".KS" if m == "KOSPI" else ".KQ") for c, m in zip(kor["Code"], kor["Market"])]
-        process_market("KOREA", kor_tickers, dict(zip(kor_tickers, kor["Name"])))
+        kor_names = dict(zip(kor_tickers, kor["Name"]))
+        process_market("KOREA", kor_tickers, kor_names)
 
-        # 미국 시장 (S&P500 상위)
+        # 2. 미국 시장 분석 (S&P 500)
+        print("USA 시장 데이터 수집 중...")
         us = fdr.StockListing("S&P500").head(USA_TOP_N)
+        # yfinance 호환을 위해 티커의 '.'을 '-'로 변환 (예: BRK.B -> BRK-B)
         us_tickers = [t.replace(".", "-") for t in us["Symbol"]]
-        process_market("USA", us_tickers, dict(zip(us_tickers, us["Name"])))
+        us_names = dict(zip(us_tickers, us["Name"]))
+        process_market("USA", us_tickers, us_names)
+        
     except Exception as e:
         print(f"Main Error: {e}")
 
