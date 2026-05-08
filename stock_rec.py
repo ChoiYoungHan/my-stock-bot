@@ -71,8 +71,8 @@ def analyze_logic(ticker, df, name):
     df = calculate_indicators(df)
     
     try:
-        curr = df.iloc[-1]    # 당일 (양봉 기대)
-        prev = df.iloc[-2]    # 전일 (도지 기대)
+        curr = df.iloc[-1]    # 당일 (양봉 반등 기대)
+        prev = df.iloc[-2]    # 전일 (양봉 도지 기대)
         d2 = df.iloc[-3]      # 2일 전 (하락)
         d3 = df.iloc[-4]      # 3일 전 (하락 시작)
     except IndexError:
@@ -87,19 +87,22 @@ def analyze_logic(ticker, df, name):
         "candle": candle_type
     }
     
-    # --- [변곡점 전략 수정: 하락 -> 전일 종가 아래 도지 -> 당일 양봉] ---
-    # 1. 2일 연속 하락 (T-3 > T-2 > T-1의 시점까지 하락세)
-    is_falling = (d3['Close'] > d2['Close']) and (d2['Close'] > prev['Close'])
+    # --- [변곡점 전략: 하락 -> 전일 종가 아래 '양봉 도지' -> 당일 양봉] ---
+    # 1. 이전까지 하락 추세 (T-3 > T-2)
+    is_falling = (d3['Close'] > d2['Close'])
     
-    # 2. 전일(T-1)이 도지형 캔들이면서, 도지의 몸통(시가/종가)이 2일 전(T-2) 종가보다 낮음
+    # 2. 전일(T-1) 조건:
+    #   - 도지형 (몸통이 전체의 20% 이하)
+    #   - 양봉 도지 (종가가 시가보다 높음)
+    #   - 위치 (도지 몸통이 T-2 종가보다 낮음)
     prev_total = (prev['High'] - prev['Low'])
-    is_prev_doji = (abs(prev['Open'] - prev['Close']) <= prev_total * 0.2) if prev_total > 0 else False
-    is_doji_below = max(prev['Open'], prev['Close']) < d2['Close'] # 도지의 상단이 전일 종가보다 낮음
+    is_prev_doji = (0 < (prev['Close'] - prev['Open']) <= prev_total * 0.2) if prev_total > 0 else False
+    is_doji_below = prev['Close'] < d2['Close']
     
-    # 3. 금일(T)이 양봉
+    # 3. 금일(T) 조건: 확실한 양봉 반등
     is_today_bullish = curr['Close'] > curr['Open']
     
-    # 4. 바닥권 조건: 전일이나 금일이 BB 하단 근처 (3% 여유)
+    # 4. 바닥권 조건: BB 하단 3% 이내 지지 확인
     is_near_bb_bottom = (prev['Close'] <= prev['BB_L'] * 1.03) or (curr['Low'] <= curr['BB_L'] * 1.02)
 
     if is_falling and is_prev_doji and is_doji_below and is_today_bullish and is_near_bb_bottom:
@@ -158,14 +161,14 @@ def process_market(market_name, tickers, names):
         output += "\n"
     send_telegram(output)
 
-    # 변곡점 리포트 (수정된 도지 조건 반영)
+    # 변곡점 리포트 (양봉 도지 반등)
     if storage["REVERSAL"]:
-        rev_msg = f"{header} **[{market_name}] 하락 갭-도지 반등 포착**\n"
-        rev_msg += "*(전일 종가 아래 도지 + 당일 양봉)*\n\n"
+        rev_msg = f"{header} **[{market_name}] 양봉도지 반등 포착**\n"
+        rev_msg += "*(전일 저가 양봉도지 + 금일 반등 양봉)*\n\n"
         for i in storage["REVERSAL"]:
-            rev_msg += f"🔥 **{i['name']}**\n"
+            rev_msg += f"✨ **{i['name']}**\n"
             rev_msg += f"└ 현재가: {cur_symbol}{i['price']:,.2f} ({i['change']:+.2f}%)\n"
-            rev_msg += f"└ 특징: 이전 종가 아래에서 변곡점 형성\n\n"
+            rev_msg += f"└ 특징: 하락 끝에 양봉도지로 추세 저지\n\n"
         send_telegram(rev_msg)
 
 def main():
