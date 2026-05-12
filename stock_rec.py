@@ -44,7 +44,9 @@ def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
     c, h, l, v = df["Close"], df["High"], df["Low"], df["Volume"]
     
     df["MA20"] = c.rolling(20).mean()
-    df["BB_LOWER"] = df["MA20"] - (c.rolling(20).std() * 2)
+    df["STD"] = c.rolling(20).std()
+    df["BB_LOWER"] = df["MA20"] - (df["STD"] * 2)
+    df["BB_UPPER"] = df["MA20"] + (df["STD"] * 2)
     
     delta = c.diff()
     gain = delta.where(delta > 0, 0).rolling(14).mean()
@@ -62,9 +64,10 @@ def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 # =========================================================
-# 3. 분석 로직 (기존 스코어링 & 다이버전스)
+# 3. 분석 로직
 # =========================================================
 
+# (1) 기존 스코어링 로직
 def analyze_logic(ticker: str, df: pd.DataFrame, name: str, market: str, is_bull: bool) -> Optional[dict]:
     if len(df) < 50: return None
     curr, prev = df.iloc[-1], df.iloc[-2]
@@ -98,9 +101,9 @@ def analyze_logic(ticker: str, df: pd.DataFrame, name: str, market: str, is_bull
         "rsi": curr["RSI"], "core": core_tags, "bonus": bonus_tags
     }
 
+# (2) 기존 다이버전스 로직
 def analyze_divergence(ticker: str, df: pd.DataFrame, name: str, market: str) -> Optional[dict]:
     if len(df) < 30: return None
-    
     recent = df.tail(10)
     prev_period = df.iloc[-25:-10]
     
@@ -110,12 +113,36 @@ def analyze_divergence(ticker: str, df: pd.DataFrame, name: str, market: str) ->
     curr_rsi = recent.loc[recent["Low"].idxmin(), "RSI"]
     prev_rsi = prev_period.loc[prev_period["Low"].idxmin(), "RSI"]
     
-    # 가격 저점 하락 & RSI 저점 상승 (40 미만)
     if curr_low_price < prev_low_price and curr_rsi > prev_rsi and curr_rsi < 40:
         curr = df.iloc[-1]
         return {
             "name": name, "price": curr["Close"], "rsi": curr_rsi,
             "change": ((curr["Close"]/df.iloc[-2]["Close"])-1)*100
+        }
+    return None
+
+# (3) 신규: 볼린저 밴드 하단 재진입 로직
+def analyze_bb_reentry(ticker: str, df: pd.DataFrame, name: str, market: str) -> Optional[dict]:
+    if len(df) < 5: return None
+    
+    # 오늘(-1), 어제(-2), 그저께(-3) 데이터
+    curr = df.iloc[-1]
+    prev = df.iloc[-2]
+    prev2 = df.iloc[-3]
+    
+    reentry = False
+    # Case 1: 오늘 재진입 (어제는 하단 아래, 오늘은 하단 위)
+    if prev["Close"] < prev["BB_LOWER"] and curr["Close"] > curr["BB_LOWER"]:
+        reentry = True
+    # Case 2: 어제 재진입 (그저께는 하단 아래, 어제는 하단 위) -> 오늘까지 유지 중인 경우
+    elif prev2["Close"] < prev2["BB_LOWER"] and prev["Close"] > prev["BB_LOWER"] and curr["Close"] > curr["BB_LOWER"]:
+        reentry = True
+
+    if reentry:
+        return {
+            "name": name, "price": curr["Close"],
+            "change": ((curr["Close"]/prev["Close"])-1)*100,
+            "lower": curr["BB_LOWER"]
         }
     return None
 
@@ -138,6 +165,7 @@ def process_market(market_name: str, tickers: list, names: dict, is_bull: bool):
 
     score_results = []
     div_results = []
+    bb_reentry_results = []
 
     for ticker in tickers:
         try:
@@ -146,23 +174,30 @@ def process_market(market_name: str, tickers: list, names: dict, is_bull: bool):
             if df.empty: continue
             df = calculate_indicators(df)
 
+            # 기존 스코어링
             s_res = analyze_logic(ticker, df, names.get(ticker, ticker), market_name, is_bull)
             if s_res: score_results.append(s_res)
 
+            # 다이버전스
             d_res = analyze_divergence(ticker, df, names.get(ticker, ticker), market_name)
             if d_res: div_results.append(d_res)
+            
+            # BB 하단 재진입 (신규)
+            bb_res = analyze_bb_reentry(ticker, df, names.get(ticker, ticker), market_name)
+            if bb_res: bb_reentry_results.append(bb_res)
         except: continue
+
+    flag = "🇰🇷" if market_name == "KOREA" else "🇺🇸"
+    unit = "₩" if market_name == "KOREA" else "$"
 
     # 메시지 1: 기존 스코어 분석
     score_results = sorted(score_results, key=lambda x: -x["score"])[:10]
     if score_results:
-        flag = "🇰🇷" if market_name == "KOREA" else "🇺🇸"
         msg = f"<b>{flag} {market_name} 바닥 반등</b>\n"
         msg += f"<i>추세: {'🔵상승/횡보' if is_bull else '🔴하락(보정)'}</i>\n\n"
         for i, r in enumerate(score_results):
             core_str = " ".join([f"#{t}" for t in r["core"]])
             bonus_str = f" <code>[{', '.join(r['bonus'])}]</code>" if r["bonus"] else ""
-            unit = "₩" if market_name == "KOREA" else "$"
             msg += f"{i+1}. <b>{html.escape(r['name'])}</b> ({r['score']}점){bonus_str}\n"
             msg += f"└ 💰 {unit}{r['price']:,.0f} ({r['change']:+.1f}%) | RSI:{r['rsi']:.0f}\n"
             msg += f"└ 📊 {core_str}\n\n"
@@ -174,9 +209,18 @@ def process_market(market_name: str, tickers: list, names: dict, is_bull: bool):
         msg = f"<b>🔍 {market_name} RSI 상승 다이버전스</b>\n"
         msg += f"<i>대상: 40 미만 저점 반등 포착</i>\n\n"
         for i, r in enumerate(div_results):
-            unit = "₩" if market_name == "KOREA" else "$"
             msg += f"{i+1}. <b>{html.escape(r['name'])}</b>\n"
             msg += f"└ 💰 {unit}{r['price']:,.0f} ({r['change']:+.1f}%) | RSI:{r['rsi']:.1f}\n\n"
+        send_telegram(msg)
+        
+    # 메시지 3: 볼린저 밴드 하단 재진입 (신규 요청 사항)
+    if bb_reentry_results:
+        bb_reentry_results = bb_reentry_results[:10]
+        msg = f"<b>🛡️ {market_name} BB 하단 재진입</b>\n"
+        msg += f"<i>대상: 밴드 하단 이탈 후 안쪽 복귀 포착(어제/오늘)</i>\n\n"
+        for i, r in enumerate(bb_reentry_results):
+            msg += f"{i+1}. <b>{html.escape(r['name'])}</b>\n"
+            msg += f"└ 💰 {unit}{r['price']:,.0f} ({r['change']:+.1f}%) | 하단선:{r['lower']:,.0f}\n\n"
         send_telegram(msg)
 
 def main():
@@ -186,14 +230,16 @@ def main():
         kor = fdr.StockListing("KRX").sort_values("Marcap", ascending=False).head(KOR_TOP_N)
         kor_tickers = [str(c) + (".KS" if m == "KOSPI" else ".KQ") for c, m in zip(kor["Code"], kor["Market"])]
         process_market("KOREA", kor_tickers, dict(zip(kor_tickers, kor["Name"])), regime["KOREA"])
-    except: pass
+    except Exception as e:
+        logger.error(f"한국 시장 처리 실패: {e}")
 
     # USA
     try:
         us = fdr.StockListing("S&P500").head(USA_TOP_N)
         us_names = {str(row["Symbol"]).replace(".", "-"): row["Name"] for _, row in us.iterrows()}
         process_market("USA", list(us_names.keys()), us_names, regime["USA"])
-    except: pass
+    except Exception as e:
+        logger.error(f"미국 시장 처리 실패: {e}")
 
 if __name__ == "__main__":
     main()
