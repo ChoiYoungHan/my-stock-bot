@@ -121,42 +121,31 @@ def analyze_divergence(ticker: str, df: pd.DataFrame, name: str, market: str) ->
         }
     return None
 
-# (3) 신규: 주봉 기준 볼린저 밴드 하단 재진입 로직
-def analyze_bb_reentry_weekly(df_daily: pd.DataFrame, name: str) -> Optional[dict]:
+# (3) 보완된 일봉 기준 볼린저 밴드 하단 재진입 로직
+def analyze_bb_reentry_daily(df: pd.DataFrame, name: str) -> Optional[dict]:
     """
-    일봉 데이터를 주봉으로 리샘플링하여 BB 하단 재진입 여부 판단
+    일봉 기준 BB 하단 재진입 판별 (거래량 증가 + 양봉 조건 추가)
     """
-    if len(df_daily) < 100: return None
+    if len(df) < 25: return None
     
-    # 주봉 변환 (Open: 첫값, High: 최대, Low: 최소, Close: 마지막, Volume: 합계)
-    df_weekly = df_daily.resample('W').agg({
-        'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last', 'Volume': 'sum'
-    }).dropna()
+    curr = df.iloc[-1]
+    prev = df.iloc[-2]
     
-    if len(df_weekly) < 20: return None
+    # 1. 재진입 조건 (어제 종가가 하단 아래 -> 오늘 종가가 하단 위)
+    is_reentry = prev["Close"] < prev["BB_LOWER"] and curr["Close"] > curr["BB_LOWER"]
     
-    # 주봉 지표 계산
-    df_weekly["MA20"] = df_weekly["Close"].rolling(20).mean()
-    df_weekly["STD"] = df_weekly["Close"].rolling(20).std()
-    df_weekly["BB_LOWER"] = df_weekly["MA20"] - (df_weekly["STD"] * 2)
+    # [필터링] 하락 가속 방지
+    # 2. 오늘 종가가 시가보다 높을 것 (양봉)
+    is_bullish = curr["Close"] > curr["Open"]
+    # 3. 오늘 거래량이 어제 거래량보다 많을 것 (매수세 유입)
+    is_vol_up = curr["Volume"] > prev["Volume"]
     
-    w_curr = df_weekly.iloc[-1]
-    w_prev = df_weekly.iloc[-2]
-    w_prev2 = df_weekly.iloc[-3]
-    
-    reentry = False
-    # 이번 주 재진입 (지난 주 하단 아래 -> 이번 주 현재 하단 위)
-    if w_prev["Close"] < w_prev["BB_LOWER"] and w_curr["Close"] > w_curr["BB_LOWER"]:
-        reentry = True
-    # 지난 주 재진입 (지지난 주 하단 아래 -> 지난 주 하단 위 마감)
-    elif w_prev2["Close"] < w_prev2["BB_LOWER"] and w_prev["Close"] > w_prev["BB_LOWER"] and w_curr["Close"] > w_curr["BB_LOWER"]:
-        reentry = True
-        
-    if reentry:
+    if is_reentry and is_bullish and is_vol_up:
         return {
-            "name": name, "price": w_curr["Close"],
-            "change": ((w_curr["Close"]/w_prev["Close"])-1)*100,
-            "lower": w_curr["BB_LOWER"]
+            "name": name, "price": curr["Close"],
+            "change": ((curr["Close"]/prev["Close"])-1)*100,
+            "lower": curr["BB_LOWER"],
+            "vol_ratio": (curr["Volume"] / prev["Volume"]) * 100
         }
     return None
 
@@ -174,13 +163,12 @@ def send_telegram(msg: str):
 def process_market(market_name: str, tickers: list, names: dict, is_bull: bool):
     logger.info(f"[{market_name}] 데이터 분석 시작...")
     try:
-        # 주봉 분석을 위해 충분한 기간(2년) 데이터 수집
-        data = yf.download(tickers, period="2y", group_by="ticker", auto_adjust=False, threads=True, progress=False)
+        data = yf.download(tickers, period="12mo", group_by="ticker", auto_adjust=False, threads=True, progress=False)
     except: return
 
     score_results = []
     div_results = []
-    bb_weekly_results = []
+    bb_daily_results = []
 
     for ticker in tickers:
         try:
@@ -188,20 +176,20 @@ def process_market(market_name: str, tickers: list, names: dict, is_bull: bool):
             df = data[ticker].dropna()
             if df.empty: continue
             
-            # 일봉 지표 계산 (기존 로직용)
-            df_daily = calculate_indicators(df)
+            # 공통 지표 계산
+            df = calculate_indicators(df)
 
             # 1. 일봉 스코어링
-            s_res = analyze_logic(ticker, df_daily, names.get(ticker, ticker), market_name, is_bull)
+            s_res = analyze_logic(ticker, df, names.get(ticker, ticker), market_name, is_bull)
             if s_res: score_results.append(s_res)
 
             # 2. 일봉 다이버전스
-            d_res = analyze_divergence(ticker, df_daily, names.get(ticker, ticker), market_name)
+            d_res = analyze_divergence(ticker, df, names.get(ticker, ticker), market_name)
             if d_res: div_results.append(d_res)
             
-            # 3. 주봉 BB 하단 재진입 (신규)
-            bb_res = analyze_bb_reentry_weekly(df, names.get(ticker, ticker))
-            if bb_res: bb_weekly_results.append(bb_res)
+            # 3. 일봉 BB 하단 재진입 (보완 로직)
+            bb_res = analyze_bb_reentry_daily(df, names.get(ticker, ticker))
+            if bb_res: bb_daily_results.append(bb_res)
             
         except: continue
 
@@ -212,11 +200,9 @@ def process_market(market_name: str, tickers: list, names: dict, is_bull: bool):
     score_results = sorted(score_results, key=lambda x: -x["score"])[:10]
     if score_results:
         msg = f"<b>{flag} {market_name} 일봉 바닥 반등</b>\n"
-        msg += f"<i>추세: {'🔵상승/횡보' if is_bull else '🔴하락(보정)'}</i>\n\n"
         for i, r in enumerate(score_results):
             core_str = " ".join([f"#{t}" for t in r["core"]])
-            bonus_str = f" <code>[{', '.join(r['bonus'])}]</code>" if r["bonus"] else ""
-            msg += f"{i+1}. <b>{html.escape(r['name'])}</b> ({r['score']}점){bonus_str}\n"
+            msg += f"{i+1}. <b>{html.escape(r['name'])}</b> ({r['score']}점)\n"
             msg += f"└ 💰 {unit}{r['price']:,.0f} ({r['change']:+.1f}%) | RSI:{r['rsi']:.0f}\n"
             msg += f"└ 📊 {core_str}\n\n"
         send_telegram(msg)
@@ -225,20 +211,20 @@ def process_market(market_name: str, tickers: list, names: dict, is_bull: bool):
     div_results = div_results[:10]
     if div_results:
         msg = f"<b>🔍 {market_name} 일봉 상승 다이버전스</b>\n"
-        msg += f"<i>대상: 40 미만 저점 반등 포착</i>\n\n"
         for i, r in enumerate(div_results):
             msg += f"{i+1}. <b>{html.escape(r['name'])}</b>\n"
             msg += f"└ 💰 {unit}{r['price']:,.0f} ({r['change']:+.1f}%) | RSI:{r['rsi']:.1f}\n\n"
         send_telegram(msg)
         
-    # 메시지 3: 주봉 볼린저 밴드 하단 재진입
-    if bb_weekly_results:
-        bb_weekly_results = bb_weekly_results[:10]
-        msg = f"<b>🛡️ {market_name} 주봉 BB 하단 재진입</b>\n"
-        msg += f"<i>대상: 주봉 하단 이탈 후 안쪽 복귀(이번주/지난주)</i>\n\n"
-        for i, r in enumerate(bb_weekly_results):
+    # 메시지 3: 일봉 BB 하단 재진입 (보완 로직)
+    if bb_daily_results:
+        bb_daily_results = bb_daily_results[:10]
+        msg = f"<b>🛡️ {market_name} 일봉 BB 재진입 (검증)</b>\n"
+        msg += f"<i>조건: 양봉 마감 + 전일대비 거래량 증가</i>\n\n"
+        for i, r in enumerate(bb_daily_results):
             msg += f"{i+1}. <b>{html.escape(r['name'])}</b>\n"
-            msg += f"└ 💰 {unit}{r['price']:,.0f} ({r['change']:+.1f}%) | 주봉하단:{r['lower']:,.0f}\n\n"
+            msg += f"└ 💰 {unit}{r['price']:,.0f} ({r['change']:+.1f}%)\n"
+            msg += f"└ 📊 거래량비: {r['vol_ratio']:.0f}% | 하단선:{r['lower']:,.0f}\n\n"
         send_telegram(msg)
 
 def main():
