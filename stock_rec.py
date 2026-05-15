@@ -123,13 +123,8 @@ def analyze_divergence(ticker: str, df: pd.DataFrame, name: str, market: str) ->
 
 # (3) 기존 일봉 기준 볼린저 밴드 하단 재진입 로직
 def analyze_bb_reentry_daily(df: pd.DataFrame, name: str) -> Optional[dict]:
-    """
-    일봉 기준 BB 하단 재진입 판별 (거래량 증가 + 양봉 조건 추가)
-    """
     if len(df) < 25: return None
-    
-    curr = df.iloc[-1]
-    prev = df.iloc[-2]
+    curr, prev = df.iloc[-1], df.iloc[-2]
     
     is_reentry = prev["Close"] < prev["BB_LOWER"] and curr["Close"] > curr["BB_LOWER"]
     is_bullish = curr["Close"] > curr["Open"]
@@ -144,60 +139,53 @@ def analyze_bb_reentry_daily(df: pd.DataFrame, name: str) -> Optional[dict]:
         }
     return None
 
-# (4) 신규 추가: 적삼병 후 거래량 감소 눌림목 반등 로직
-def analyze_three_soldiers_pullback(df: pd.DataFrame, name: str) -> Optional[dict]:
+# (4) 5분봉 스케일로 전면 수정된 적삼병 후 눌림목 반등 로직
+def analyze_three_soldiers_pullback_5m(df_5m: pd.DataFrame, name: str) -> Optional[dict]:
     """
-    적삼병(3양봉) 후 2~3일 음봉 조정을 거치되, 
-    조정 시 거래량이 급감하고 적삼병 중심선을 지키며 당일 양봉 전환(반등)하는 종목 포착
+    5분봉 기준: 3연속 양봉(강한 상승) 후, 2~3개 캔들 동안 거래량이 줄어들며 
+    상승폭의 중심선 부근까지 눌렸다가 현재 5분봉에서 양봉 반등하는 종목 포착
     """
-    if len(df) < 10: return None
+    if len(df_5m) < 15: return None
     
-    # 최근 7거래일 데이터 확인 (음봉 2일 조정 케이스 vs 음봉 3일 조정 케이스 검사)
-    # 오늘(Index -1)은 무조건 반등 양봉이어야 함
-    curr = df.iloc[-1]
+    # 현재 미완성 5분봉 캔들도 양봉(현재가 > 시가)이어야 실시간 진입 성립
+    curr = df_5m.iloc[-1]
     if curr["Close"] <= curr["Open"]: return None
     
-    # 패턴 매칭용 헬퍼 변수
-    def check_pattern(pullback_days: int) -> Optional[dict]:
-        # 전체 패턴 길이 = 적삼병(3일) + 조정(2~3일) + 당일반등(1일)
-        total_days = 3 + pullback_days + 1
-        sub_df = df.iloc[-total_days:]
+    def check_pattern(pullback_candles: int) -> Optional[dict]:
+        total_candles = 3 + pullback_candles + 1
+        sub_df = df_5m.iloc[-total_candles:]
         
-        # 1. 적삼병 구간 (구간 내 인덱스 0, 1, 2)
+        # 1. 5분봉 적삼병 구간 (연속 3개 양봉)
         three_bulls = sub_df.iloc[0:3]
         for _, row in three_bulls.iterrows():
-            if row["Close"] <= row["Open"]: return None # 3일 연속 양봉이어야 함
+            if row["Close"] <= row["Open"]: return None
             
-        # 적삼병 구간의 전체 고가, 저가, 평균 거래량 계산
         red_low = three_bulls["Low"].min()
         red_high = three_bulls["High"].max()
-        red_mid = (red_low + red_high) / 2 # 적삼병의 중간값 (지지선)
+        red_mid = (red_low + red_high) / 2 # 5분봉 기준 피보나치 0.5 지지선
         red_vol_avg = three_bulls["Volume"].mean()
         
-        # 2. 음봉 조정 구간 (구간 내 인덱스 3부터 3+pullback_days까지)
-        bears = sub_df.iloc[3:3+pullback_days]
+        # 2. 5분봉 음봉 조정 구간 (2~3개 캔들 연속 음봉)
+        bears = sub_df.iloc[3:3+pullback_candles]
         for _, row in bears.iterrows():
-            if row["Close"] >= row["Open"]: return None # 조정일은 모두 음봉이어야 함
-            # [필터] 조정 시 음봉 거래량이 적삼병 평균 거래량보다 작아야 함 (거래량 감소 눌림목)
-            if row["Volume"] >= red_vol_avg * 0.85: return None 
-            # [필터] 조정 시 종가가 적삼병 중심선 아래로 과도하게 밀리면 제외
-            if row["Close"] < red_mid: return None
+            if row["Close"] >= row["Open"]: return None
+            # 분봉 노이즈를 감안해 음봉 거래량이 상승 평균 거래량의 90% 미만인지 체크 (거래량 감소)
+            if row["Volume"] >= red_vol_avg * 0.90: return None 
+            if row["Close"] < red_mid * 0.995: return None # 중심선 이탈 방지
             
-        # 3. 오늘(최종 반등일)의 검증
-        # 저가가 중심선 부근에서 지지받고 올라왔는지 확인
-        if curr["Low"] < red_mid * 0.98: return None # 중심선을 너무 깊게 깨면 제외
+        # 3. 현재 5분봉 지지 확인
+        if curr["Low"] < red_mid * 0.99: return None
         
         return {
             "name": name, "price": curr["Close"],
-            "change": ((curr["Close"] / df.iloc[-2]["Close"]) - 1) * 100,
-            "pullback_days": pullback_days,
+            "change": ((curr["Close"] / df_5m.iloc[-2]["Close"]) - 1) * 100,
+            "pullback_candles": pullback_candles,
             "mid_price": red_mid
         }
 
-    # 음봉 2일 조정 후 반등 패턴 먼저 체크 -> 없으면 3일 조정 체크
-    result = check_pattern(pullback_days=2)
+    result = check_pattern(pullback_candles=2)
     if not result:
-        result = check_pattern(pullback_days=3)
+        result = check_pattern(pullback_candles=3)
         
     return result
 
@@ -213,42 +201,51 @@ def send_telegram(msg: str):
     except: pass
 
 def process_market(market_name: str, tickers: list, names: dict, is_bull: bool):
-    logger.info(f"[{market_name}] 데이터 분석 시작...")
+    logger.info(f"[{market_name}] 일봉 및 5분봉 데이터 다운로드 중...")
+    
+    # 1. 기존 일봉 데이터 다운로드 (1, 2, 3번 로직용)
     try:
-        data = yf.download(tickers, period="12mo", group_by="ticker", auto_adjust=False, threads=True, progress=False)
-    except: return
+        data_daily = yf.download(tickers, period="12mo", group_by="ticker", auto_adjust=False, threads=True, progress=False)
+    except: data_daily = pd.DataFrame()
+
+    # 2. 신규 5분봉 데이터 다운로드 (4번 로직용 / 최대 5일 분량 제한)
+    try:
+        data_5m = yf.download(tickers, period="5d", interval="5m", group_by="ticker", auto_adjust=False, threads=True, progress=False)
+    except: data_5m = pd.DataFrame()
 
     score_results = []
     div_results = []
     bb_daily_results = []
-    pullback_results = [] # 신규 결과 배열
+    pullback_results = []
 
     for ticker in tickers:
-        try:
-            if ticker not in data.columns.levels[0]: continue
-            df = data[ticker].dropna()
-            if df.empty: continue
-            
-            # 공통 지표 계산
-            df = calculate_indicators(df)
+        name = names.get(ticker, ticker)
+        
+        # 일봉 기반 분석 실행
+        if not data_daily.empty and ticker in data_daily.columns.levels[0]:
+            try:
+                df_d = data_daily[ticker].dropna()
+                if not df_d.empty:
+                    df_d = calculate_indicators(df_d)
+                    
+                    s_res = analyze_logic(ticker, df_d, name, market_name, is_bull)
+                    if s_res: score_results.append(s_res)
 
-            # 1. 일봉 스코어링
-            s_res = analyze_logic(ticker, df, names.get(ticker, ticker), market_name, is_bull)
-            if s_res: score_results.append(s_res)
+                    d_res = analyze_divergence(ticker, df_d, name, market_name)
+                    if d_res: div_results.append(d_res)
+                    
+                    bb_res = analyze_bb_reentry_daily(df_d, name)
+                    if bb_res: bb_daily_results.append(bb_res)
+            except: pass
 
-            # 2. 일봉 다이버전스
-            d_res = analyze_divergence(ticker, df, names.get(ticker, ticker), market_name)
-            if d_res: div_results.append(d_res)
-            
-            # 3. 일봉 BB 하단 재진입 (보완 로직)
-            bb_res = analyze_bb_reentry_daily(df, names.get(ticker, ticker))
-            if bb_res: bb_daily_results.append(bb_res)
-            
-            # 4. 일봉 적삼병 후 눌림목 반등 (신규 로직)
-            pb_res = analyze_three_soldiers_pullback(df, names.get(ticker, ticker))
-            if pb_res: pullback_results.append(pb_res)
-            
-        except: continue
+        # 5분봉 기반 분석 실행 (4번 로직)
+        if not data_5m.empty and ticker in data_5m.columns.levels[0]:
+            try:
+                df_5 = data_5m[ticker].dropna()
+                if not df_5.empty:
+                    pb_res = analyze_three_soldiers_pullback_5m(df_5, name)
+                    if pb_res: pullback_results.append(pb_res)
+            except: pass
 
     flag = "🇰🇷" if market_name == "KOREA" else "🇺🇸"
     unit = "₩" if market_name == "KOREA" else "$"
@@ -273,7 +270,7 @@ def process_market(market_name: str, tickers: list, names: dict, is_bull: bool):
             msg += f"└ 💰 {unit}{r['price']:,.0f} ({r['change']:+.1f}%) | RSI:{r['rsi']:.1f}\n\n"
         send_telegram(msg)
         
-    # 메시지 3: 일봉 BB 하단 재진입 (보완 로직)
+    # 메시지 3: 일봉 BB 하단 재진입
     if bb_daily_results:
         bb_daily_results = bb_daily_results[:10]
         msg = f"<b>🛡️ {market_name} 일봉 BB 재진입 (검증)</b>\n"
@@ -284,15 +281,15 @@ def process_market(market_name: str, tickers: list, names: dict, is_bull: bool):
             msg += f"└ 📊 거래량비: {r['vol_ratio']:.0f}% | 하단선:{r['lower']:,.0f}\n\n"
         send_telegram(msg)
 
-    # 메시지 4: 일봉 적삼병 후 거래량 감소 눌림목 반등 (신규 메세지)
+    # 메시지 4: 5분봉 적삼병 후 거래량 감소 눌림목 반등 (수정됨)
     if pullback_results:
         pullback_results = pullback_results[:10]
-        msg = f"<b>📈 {market_name} 적삼병 후 눌림목 반등</b>\n"
-        msg += f"<i>조건: 3양봉 후 거래량 급감 2~3음봉 조정 + 중심선 지지 반등</i>\n\n"
+        msg = f"<b>⚡ {market_name} 5분봉 눌림목 타점 포착</b>\n"
+        msg += f"<i>조건: 5분봉 3연속 양봉 후 거래량 급감 조정 + 중심선 지지 반등</i>\n\n"
         for i, r in enumerate(pullback_results):
             msg += f"{i+1}. <b>{html.escape(r['name'])}</b>\n"
-            msg += f"└ 💰 {unit}{r['price']:,.0f} ({r['change']:+.1f}%)\n"
-            msg += f"└ 📊 {r['pullback_days']}일간 음봉 조정 후 오늘 양봉 전환 | 기준선:{r['mid_price']:,.0f}\n\n"
+            msg += f"└ 💰 현재가: {unit}{r['price']:,.0f} ({r['change']:+.1f}%)\n"
+            msg += f"└ 📊 5분봉 {r['pullback_candles']}개 음봉 조정 후 양봉 턴어라운드 | 기준선:{r['mid_price']:,.0f}\n\n"
         send_telegram(msg)
 
 def main():
